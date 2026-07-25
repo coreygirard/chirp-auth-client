@@ -534,6 +534,12 @@ pub const ID_TOKEN_TYP: &str = "chirp-id+jwt";
 /// when verifying a cert so a cert can't be honored as an ID token (or vice
 /// versa).
 pub const KEYBIND_TYP: &str = "chirp-keybind+jwt";
+/// JWT `typ` for ChirpAuth resource-scoped access tokens (RFC 8707): `aud` is a
+/// RESOURCE (e.g. `drive`), not the requesting client, and the token carries a
+/// space-separated `scope` claim. A resource server verifies one of these with
+/// [`verify_chirp_resource_access_token`]. Distinct from [`ID_TOKEN_TYP`] so an
+/// RP ID token can never be honored as resource authority (or vice versa).
+pub const ACCESS_TOKEN_TYP: &str = "chirp-access+jwt";
 
 #[derive(Debug, Deserialize)]
 struct JwtHeader {
@@ -801,6 +807,77 @@ pub async fn verify_from_headers(
     verify_chirp_id_token(client, config, token, options)
         .await
         .map(|verified| verified.identity)
+}
+
+/// A verified resource-scoped access token (RFC 8707): the human `sub` acting on
+/// a RESOURCE, the `resource` the token is audience'd to (the matched audience),
+/// and the granted `scopes`, alongside the [`Environment`] that verified it.
+///
+/// Unlike [`ChirpVerifiedIdentity`], this is NOT tied to the requesting client:
+/// a resource server validates `resource` (`aud`) + `scopes` and does not care
+/// which client obtained the token — that is the whole point of the
+/// resource-audience design (see chirp-auth
+/// `protocols/docs/adr-resource-scoped-access-tokens.md`). The requesting client
+/// rides as `azp` in [`Claims::raw`] for audit if a caller wants it.
+#[derive(Clone, Debug)]
+pub struct ChirpVerifiedResourceAccess {
+    pub environment: Environment,
+    pub sub: String,
+    pub resource: String,
+    pub scopes: BTreeSet<String>,
+}
+
+impl ChirpVerifiedResourceAccess {
+    /// Whether the token grants `scope` (e.g. `"drive.deposit"`).
+    pub fn has_scope(&self, scope: &str) -> bool {
+        self.scopes.contains(scope)
+    }
+}
+
+/// Verify a ChirpAuth resource-scoped access token (`chirp-access+jwt`) end-to-end.
+///
+/// The audience allowlist ([`ChirpAuthConfig::accepted_audiences`]) is the set of
+/// RESOURCES this server serves (e.g. `{"drive"}`); the token is accepted only if
+/// its `aud` names one of them. On success the matched resource, the human `sub`,
+/// and the granted `scopes` are returned — the caller then checks it
+/// [`has_scope`](ChirpVerifiedResourceAccess::has_scope) for the action it gates.
+/// A resource token with no `scope` grants nothing and is rejected.
+///
+/// This is a thin, audited wrapper over [`verify_rs256_jws`] with
+/// `expected_typ = `[`ACCESS_TOKEN_TYP`] and `validate_aud = true`, so an ID
+/// token (or any other class) can never be honored here.
+pub async fn verify_chirp_resource_access_token(
+    client: &reqwest::Client,
+    config: &ChirpAuthConfig,
+    token: &str,
+) -> Result<ChirpVerifiedResourceAccess, ChirpAuthError> {
+    let claims = verify_rs256_jws(client, config, token, true, ACCESS_TOKEN_TYP).await?;
+    let scopes: BTreeSet<String> = claims
+        .raw
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    if scopes.is_empty() {
+        // A resource token that grants nothing is malformed for our purposes.
+        return Err(ChirpAuthError::ClaimMismatch);
+    }
+    // The resource is the token's audience that this server accepts. `aud` is
+    // single-valued for access tokens; pick the value in our allowlist.
+    let resource = claims
+        .aud
+        .iter()
+        .find(|a| config.accepted_audiences.contains(*a))
+        .cloned()
+        .ok_or(ChirpAuthError::ClaimMismatch)?;
+    Ok(ChirpVerifiedResourceAccess {
+        environment: environment_from_issuer(&claims.iss),
+        sub: claims.sub,
+        resource,
+        scopes,
+    })
 }
 
 /// Verify a ChirpAuth-issued RS256 ID token end-to-end.
@@ -1374,6 +1451,57 @@ mod verify_path_tests {
             }
             _ => panic!("expected Human"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accepts_a_resource_access_token_and_exposes_scopes() {
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let header = format!(r#"{{"alg":"RS256","typ":"{ACCESS_TOKEN_TYP}","kid":"{KID}"}}"#);
+        let exp = now_unix() + 3600;
+        let claims = format!(
+            r#"{{"iss":"{ISS}","sub":"sub_test","aud":"drive","azp":"app_gotta","scope":"drive.deposit","exp":{exp}}}"#
+        );
+        let token = make_signed_jwt(&header, &claims);
+        // The resource server's audience allowlist is the RESOURCE it serves.
+        let config = ChirpAuthConfig::new(ISS, "drive").with_jwks_uri(jwks);
+        let verified = verify_chirp_resource_access_token(&reqwest::Client::new(), &config, &token)
+            .await
+            .expect("verify resource access token");
+        assert_eq!(verified.environment, Environment::Prod);
+        assert_eq!(verified.sub, "sub_test");
+        assert_eq!(verified.resource, "drive");
+        assert!(verified.has_scope("drive.deposit"));
+        assert!(!verified.has_scope("drive.admin"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resource_verifier_rejects_an_id_token() {
+        // An ID token (chirp-id+jwt) must never be honored as resource authority:
+        // the typ gate rejects it before any claim is trusted.
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let token = make_signed_jwt(&good_header(), &good_claims(ISS, "drive", now_unix() + 3600));
+        let config = ChirpAuthConfig::new(ISS, "drive").with_jwks_uri(jwks);
+        let err = verify_chirp_resource_access_token(&reqwest::Client::new(), &config, &token)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::InvalidTokenType), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resource_verifier_rejects_wrong_resource_audience() {
+        // A token audience'd to a resource this server does not serve is rejected.
+        let jwks = start_jwks_server(jwks_body_with_test_key()).await;
+        let header = format!(r#"{{"alg":"RS256","typ":"{ACCESS_TOKEN_TYP}","kid":"{KID}"}}"#);
+        let exp = now_unix() + 3600;
+        let claims = format!(
+            r#"{{"iss":"{ISS}","sub":"sub_test","aud":"calendar","scope":"drive.deposit","exp":{exp}}}"#
+        );
+        let token = make_signed_jwt(&header, &claims);
+        let config = ChirpAuthConfig::new(ISS, "drive").with_jwks_uri(jwks);
+        let err = verify_chirp_resource_access_token(&reqwest::Client::new(), &config, &token)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ChirpAuthError::ClaimMismatch), "got {err:?}");
     }
 
     // -------------------- adversarial paths --------------------

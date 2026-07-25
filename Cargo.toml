@@ -1,6 +1,6 @@
 [package]
 name = "chirp-auth-client"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 description = "Shared client-side library for ChirpAuth: ID-token verification plus machine-token minting."
 license = "MIT OR Apache-2.0"
